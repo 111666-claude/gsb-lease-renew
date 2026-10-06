@@ -20,6 +20,9 @@ type Lease struct {
 type State struct {
 	Leases []Lease  `json:"leases"`
 	Seen   []string `json:"seen"`
+
+	index map[string]int
+	seen  map[string]struct{}
 }
 
 // Counter 统计本轮检查过的租约条数。
@@ -37,13 +40,32 @@ type Result struct {
 }
 
 func find(s *State, id string, c *Counter) *Lease {
-	for i := range s.Leases {
-		c.Scanned++
-		if s.Leases[i].ID == id {
-			return &s.Leases[i]
+	if s.index == nil {
+		s.index = make(map[string]int, len(s.Leases))
+		for i := range s.Leases {
+			c.Scanned++
+			if _, ok := s.index[s.Leases[i].ID]; !ok {
+				s.index[s.Leases[i].ID] = i
+			}
 		}
 	}
-	return nil
+	c.Scanned++
+	i, ok := s.index[id]
+	if !ok {
+		return nil
+	}
+	return &s.Leases[i]
+}
+
+func (s *State) seenReq(reqID string) bool {
+	if s.seen == nil {
+		s.seen = make(map[string]struct{}, len(s.Seen))
+		for _, r := range s.Seen {
+			s.seen[r] = struct{}{}
+		}
+	}
+	_, ok := s.seen[reqID]
+	return ok
 }
 
 // Grant 授予一份租约；同一个 id 重复授予时保留原来那份。
@@ -53,6 +75,7 @@ func Grant(s *State, id, holder string, atMS, ttlMS int, c *Counter) Result {
 			Renewals: existing.Renewals, Scanned: c.Scanned}
 	}
 	s.Leases = append(s.Leases, Lease{ID: id, Holder: holder, ExpiryMS: atMS + ttlMS, TTLMS: ttlMS})
+	s.index[id] = len(s.Leases) - 1
 	return Result{ID: id, Status: "granted", ExpiryMS: atMS + ttlMS, Renewals: 0, Scanned: c.Scanned}
 }
 
@@ -62,9 +85,25 @@ func Renew(s *State, id, reqID string, atMS int, c *Counter) Result {
 	if l == nil {
 		return Result{ID: id, Status: "unknown", Scanned: c.Scanned}
 	}
+	if s.seenReq(reqID) {
+		return Result{ID: id, Status: "replay", ExpiryMS: l.ExpiryMS,
+			Renewals: l.Renewals, Scanned: c.Scanned}
+	}
+	switch {
+	case atMS >= l.ExpiryMS:
+		return Result{ID: id, Status: "expired", ExpiryMS: l.ExpiryMS,
+			Renewals: l.Renewals, Scanned: c.Scanned}
+	case atMS < l.ExpiryMS-GraceMS:
+		return Result{ID: id, Status: "too-early", ExpiryMS: l.ExpiryMS,
+			Renewals: l.Renewals, Scanned: c.Scanned}
+	case l.Renewals >= MaxRenewals:
+		return Result{ID: id, Status: "limit", ExpiryMS: l.ExpiryMS,
+			Renewals: l.Renewals, Scanned: c.Scanned}
+	}
 	l.ExpiryMS = atMS + l.TTLMS
 	l.Renewals++
 	s.Seen = append(s.Seen, reqID)
+	s.seen[reqID] = struct{}{}
 	return Result{ID: id, Status: "ok", ExpiryMS: l.ExpiryMS, Renewals: l.Renewals, Scanned: c.Scanned}
 }
 
