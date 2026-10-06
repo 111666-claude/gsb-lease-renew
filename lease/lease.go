@@ -20,6 +20,7 @@ type Lease struct {
 type State struct {
 	Leases []Lease  `json:"leases"`
 	Seen   []string `json:"seen"`
+	index  map[string]int
 }
 
 // Counter 统计本轮检查过的租约条数。
@@ -36,14 +37,33 @@ type Result struct {
 	Scanned  int    `json:"scanned"`
 }
 
-func find(s *State, id string, c *Counter) *Lease {
+func (s *State) ensureIndex() {
+	if s.index != nil {
+		return
+	}
+	s.index = make(map[string]int, len(s.Leases))
 	for i := range s.Leases {
-		c.Scanned++
-		if s.Leases[i].ID == id {
-			return &s.Leases[i]
+		s.index[s.Leases[i].ID] = i
+	}
+}
+
+func find(s *State, id string, c *Counter) *Lease {
+	s.ensureIndex()
+	c.Scanned++
+	i, ok := s.index[id]
+	if !ok {
+		return nil
+	}
+	return &s.Leases[i]
+}
+
+func (s *State) seenBefore(reqID string) bool {
+	for _, seen := range s.Seen {
+		if seen == reqID {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // Grant 授予一份租约；同一个 id 重复授予时保留原来那份。
@@ -53,14 +73,28 @@ func Grant(s *State, id, holder string, atMS, ttlMS int, c *Counter) Result {
 			Renewals: existing.Renewals, Scanned: c.Scanned}
 	}
 	s.Leases = append(s.Leases, Lease{ID: id, Holder: holder, ExpiryMS: atMS + ttlMS, TTLMS: ttlMS})
+	s.index[id] = len(s.Leases) - 1
 	return Result{ID: id, Status: "granted", ExpiryMS: atMS + ttlMS, Renewals: 0, Scanned: c.Scanned}
 }
 
-// Renew 续约一份租约。
+// Renew 续约一份租约。只有落在 [expiry-GraceMS, expiry) 窗口内的续约才顺延；
+// 同一 req_id 只生效一次；一份租约最多续约 MaxRenewals 次。
 func Renew(s *State, id, reqID string, atMS int, c *Counter) Result {
 	l := find(s, id, c)
 	if l == nil {
 		return Result{ID: id, Status: "unknown", Scanned: c.Scanned}
+	}
+	if s.seenBefore(reqID) {
+		return Result{ID: id, Status: "replay", ExpiryMS: l.ExpiryMS, Renewals: l.Renewals, Scanned: c.Scanned}
+	}
+	if atMS >= l.ExpiryMS {
+		return Result{ID: id, Status: "expired", ExpiryMS: l.ExpiryMS, Renewals: l.Renewals, Scanned: c.Scanned}
+	}
+	if atMS < l.ExpiryMS-GraceMS {
+		return Result{ID: id, Status: "too-early", ExpiryMS: l.ExpiryMS, Renewals: l.Renewals, Scanned: c.Scanned}
+	}
+	if l.Renewals >= MaxRenewals {
+		return Result{ID: id, Status: "limit", ExpiryMS: l.ExpiryMS, Renewals: l.Renewals, Scanned: c.Scanned}
 	}
 	l.ExpiryMS = atMS + l.TTLMS
 	l.Renewals++
